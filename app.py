@@ -467,7 +467,10 @@ async def on_message(message: cl.Message):
     quality_footer = (
         f"\n\n---\n"
         f"📊 **Confidence:** `{quality_report.confidence_score:.0f}/100` | "
-        f"**Keyword Match:** `{quality_report.keyword_match_accuracy:.0f}/100`"
+        f"**Keyword Match:** `{quality_report.keyword_match_accuracy:.0f}/100` | "
+        f"**Faithfulness:** `{quality_report.answer_faithfulness_score:.0f}/100` | "
+        f"**Retrieval Quality:** `{quality_report.retrieval_quality:.0f}/100` | "
+        f"**Citation Accuracy:** `{quality_report.citation_accuracy:.0f}/100`"
     )
 
     final_content = clean_answer + quality_footer

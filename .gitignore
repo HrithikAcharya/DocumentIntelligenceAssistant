@@ -32,6 +32,7 @@ env/
 ENV/
 
 # Testing
+tests/
 .pytest_cache/
 .hypothesis/
 htmlcov/

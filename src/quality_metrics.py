@@ -36,6 +36,8 @@ STOPWORDS = {
     "despite", "towards", "upon", "concerning", "as", "if", "while",
 }
 
+SUPPORT_THRESHOLD = 0.5
+
 
 def _tokenize(text: str) -> list[str]:
     """Lowercase, strip punctuation, split into tokens, remove stopwords."""
@@ -50,15 +52,20 @@ class QualityReport:
 
     confidence_score: float        # 0.0–100.0
     keyword_match_accuracy: float  # 0.0–100.0
+    answer_faithfulness_score: float = 0.0  # 0.0–100.0
+    retrieval_quality: float = 0.0          # 0.0–100.0
+    citation_accuracy: float = 0.0          # 0.0–100.0
 
     def to_json(self) -> str:
         """
-        Serialize to JSON string with exactly the keys 'confidence_score'
-        and 'keyword_match_accuracy'.
+        Serialize to JSON string with all quality metric keys.
         """
         return json.dumps({
             "confidence_score": round(self.confidence_score, 2),
             "keyword_match_accuracy": round(self.keyword_match_accuracy, 2),
+            "answer_faithfulness_score": round(self.answer_faithfulness_score, 2),
+            "retrieval_quality": round(self.retrieval_quality, 2),
+            "citation_accuracy": round(self.citation_accuracy, 2),
         })
 
 
@@ -184,10 +191,153 @@ class QualityMetricsComputer:
 
         return round(min(1.0, normalised) * 100.0, 2)
 
+    def retrieval_quality(self, query: str, chunks: list[Document]) -> float:
+        """
+        Compute retrieval quality as the average per-chunk keyword coverage.
+
+        For each retrieved chunk, calculate what fraction of query keywords
+        appear in that chunk, then average across all chunks. This measures
+        how consistently relevant the retrieved chunks are — a high score
+        means most chunks individually contain query keywords, not just the
+        combined corpus.
+
+        Args:
+            query: The user's query string.
+            chunks: Retrieved document chunks.
+
+        Returns:
+            Float in [0.0, 100.0].
+        """
+        if not query or not chunks:
+            return 0.0
+
+        keywords = _tokenize(query)
+        if not keywords:
+            return 0.0
+
+        per_chunk_scores = []
+        for chunk in chunks:
+            chunk_text = chunk.page_content.lower()
+            matched = sum(1 for kw in keywords if kw in chunk_text)
+            per_chunk_scores.append(matched / len(keywords))
+
+        return round((sum(per_chunk_scores) / len(per_chunk_scores)) * 100.0, 2)
+
+    def citation_accuracy(self, answer: str, chunks: list[Document]) -> float:
+        """
+        Compute citation accuracy as the fraction of citations in the answer
+        that reference sources and pages actually present in the retrieved chunks.
+
+        A citation [Source: file.pdf, Page N] is "valid" if:
+        - The filename matches a source in the retrieved chunks, AND
+        - The page number is within a reasonable range of pages in those chunks
+          (exact match preferred; ±1 page tolerance for chunk boundary cases).
+
+        Args:
+            answer: The LLM-generated answer text.
+            chunks: Retrieved document chunks.
+
+        Returns:
+            Float in [0.0, 100.0]. Returns 100.0 if no citations are present
+            (no citations to be wrong about).
+        """
+        if not answer:
+            return 100.0  # no answer, no citations to check
+
+        # Extract all citations from the answer
+        citation_matches = re.findall(
+            r'\[Source:\s*(.+?\.pdf),\s*Page\s*(\d+)\]',
+            answer,
+            re.IGNORECASE
+        )
+
+        if not citation_matches:
+            return 100.0  # no citations present — nothing to penalise
+
+        if not chunks:
+            return 0.0  # citations present but no chunks to validate against
+
+        # Build a set of (source, page) pairs from retrieved chunks
+        valid_sources: set[str] = set()
+        valid_pages: dict[str, set[int]] = {}  # source -> set of page numbers
+
+        for chunk in chunks:
+            src = chunk.metadata.get("source", "").lower().strip()
+            page = chunk.metadata.get("page", None)
+            if src:
+                valid_sources.add(src)
+                if page is not None:
+                    valid_pages.setdefault(src, set()).add(int(page))
+
+        valid_count = 0
+        for filename, page_str in citation_matches:
+            cited_src = filename.lower().strip()
+            cited_page = int(page_str)
+
+            # Check source exists
+            if cited_src not in valid_sources:
+                continue
+
+            # Check page is valid (exact or ±1 tolerance for chunk boundaries)
+            chunk_pages = valid_pages.get(cited_src, set())
+            if not chunk_pages:
+                # Source exists but no page metadata — give benefit of the doubt
+                valid_count += 1
+                continue
+
+            if any(abs(cited_page - p) <= 1 for p in chunk_pages):
+                valid_count += 1
+
+        return round((valid_count / len(citation_matches)) * 100.0, 2)
+
+    def answer_faithfulness_score(self, answer: str, chunks: list[Document]) -> float:
+        """
+        Compute the fraction of answer sentences whose meaningful tokens are
+        sufficiently supported by the retrieved chunk corpus.
+
+        A sentence is "supported" if at least SUPPORT_THRESHOLD (50%) of its
+        meaningful tokens appear in the combined chunk text.
+
+        Args:
+            answer: The LLM-generated answer text.
+            chunks: Retrieved document chunks.
+
+        Returns:
+            Float in [0.0, 100.0].
+        """
+        if not answer or not chunks:
+            return 0.0
+
+        # Build corpus from all retrieved chunks (lowercased)
+        corpus_text = " ".join(chunk.page_content.lower() for chunk in chunks)
+
+        # Split answer into sentences on . ! ? boundaries
+        sentences = [s.strip() for s in re.split(r'[.!?]', answer) if s.strip()]
+        if not sentences:
+            return 0.0
+
+        supported = 0
+        scoreable = 0
+
+        for sentence in sentences:
+            tokens = _tokenize(sentence)
+            if not tokens:
+                continue  # skip stopword-only sentences
+            scoreable += 1
+            matched = sum(1 for t in tokens if t in corpus_text)
+            if matched / len(tokens) >= SUPPORT_THRESHOLD:
+                supported += 1
+
+        if scoreable == 0:
+            return 0.0
+
+        return round((supported / scoreable) * 100.0, 2)
+
     def compute(
         self,
         query: str,
         retrieved_chunks: list[Document],
+        answer: str = "",
         query_embedding: Optional[list[float]] = None,  # kept for compat, unused
     ) -> QualityReport:
         """
@@ -197,20 +347,31 @@ class QualityMetricsComputer:
         Args:
             query: The user's query string.
             retrieved_chunks: Chunks retrieved from the vector store.
+            answer: The LLM-generated answer text (for faithfulness scoring).
             query_embedding: Ignored. Kept for interface compatibility.
 
         Returns:
-            QualityReport with confidence_score and keyword_match_accuracy.
+            QualityReport with confidence_score, keyword_match_accuracy,
+            and answer_faithfulness_score.
         """
         if not retrieved_chunks:
             logger.warning("No chunks provided for quality metrics computation.")
-            return QualityReport(confidence_score=0.0, keyword_match_accuracy=0.0)
+            return QualityReport(confidence_score=0.0, keyword_match_accuracy=0.0, answer_faithfulness_score=0.0)
 
         kma = self.keyword_match_accuracy(query, retrieved_chunks)
         cs = self.confidence_score(query, retrieved_chunks)
+        afs = self.answer_faithfulness_score(answer, retrieved_chunks)
+        rq = self.retrieval_quality(query, retrieved_chunks)
+        ca = self.citation_accuracy(answer, retrieved_chunks)
 
         logger.debug(
-            "Quality metrics — confidence_score: %.1f, keyword_match_accuracy: %.1f",
-            cs, kma
+            "Quality metrics — confidence: %.1f, kma: %.1f, faithfulness: %.1f, retrieval: %.1f, citation: %.1f",
+            cs, kma, afs, rq, ca
         )
-        return QualityReport(confidence_score=cs, keyword_match_accuracy=kma)
+        return QualityReport(
+            confidence_score=cs,
+            keyword_match_accuracy=kma,
+            answer_faithfulness_score=afs,
+            retrieval_quality=rq,
+            citation_accuracy=ca,
+        )

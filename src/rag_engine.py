@@ -394,7 +394,7 @@ class RAGEngine:
         citations = self._citation_parser.extract_citations(answer)
 
         # Compute quality metrics
-        quality_report = self._quality_computer.compute(query, chunks)
+        quality_report = self._quality_computer.compute(query, chunks, answer=answer)
 
         # Build response
         response = RAGResponse(
