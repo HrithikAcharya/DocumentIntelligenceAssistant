@@ -3,10 +3,10 @@ Proactive rate limiter for Google Gemini free-tier API compliance.
 Enforces limits BEFORE each API call using a sliding-window approach.
 
 Free-tier limits (as of 2025):
-  gemini-2.0-flash-lite (LLM):
-    - 30 requests per minute (RPM)
-    - 1,000,000 tokens per minute (TPM)
-    - 1,500 requests per day
+  gemini-2.5-flash (LLM):
+    - 10 requests per minute (RPM)
+    - 250,000 tokens per minute (TPM)
+    - 500 requests per day (RPD)
 
   Embeddings: handled locally via HuggingFace — no API quota.
 """
@@ -27,9 +27,9 @@ class QuotaExhaustedError(Exception):
 @dataclass
 class RateLimitConfig:
     """Configuration for Gemini free-tier rate limits."""
-    requests_per_minute: int = 30        # gemini-2.0-flash-lite free tier
-    tokens_per_minute: int = 1_000_000
-    requests_per_day: int = 1_500
+    requests_per_minute: int = 10          # gemini-2.5-flash free tier
+    tokens_per_minute: int = 250_000       # gemini-2.5-flash free tier
+    requests_per_day: int = 500            # gemini-2.5-flash free tier
 
 
 class RateLimiter:

@@ -43,8 +43,8 @@ class AppConfig:
             langsmith_project=os.environ.get("LANGCHAIN_PROJECT", "doc-intelligence"),
             model_name=os.environ.get("GEMINI_MODEL", "models/gemini-2.5-flash"),
             embedding_model="local:all-MiniLM-L6-v2",  # local, no API quota
-            top_k=int(os.environ.get("TOP_K", "10")),
-            chunk_size=int(os.environ.get("CHUNK_SIZE", "1500")),
+            top_k=int(os.environ.get("TOP_K", "5")),
+            chunk_size=int(os.environ.get("CHUNK_SIZE", "1000")),
             chunk_overlap=int(os.environ.get("CHUNK_OVERLAP", "100")),
             max_retries=int(os.environ.get("MAX_RETRIES", "5")),
             initial_retry_delay=float(os.environ.get("INITIAL_RETRY_DELAY", "1.0")),
