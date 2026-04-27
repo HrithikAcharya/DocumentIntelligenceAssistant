@@ -255,26 +255,28 @@ async def on_message(message: cl.Message):
 
             num_docs = len(doc_filenames)
 
-            # Auto-switch mode based on number of loaded documents
-            if num_docs >= 2 and mode != OperationalMode.COMPARE:
-                cl.user_session.set("mode", OperationalMode.COMPARE)
-                mode = OperationalMode.COMPARE
-                logger.info("Auto-switched to COMPARE mode (%d docs loaded)", num_docs)
-            elif num_docs == 1 and mode != OperationalMode.SINGLE_DOC:
-                cl.user_session.set("mode", OperationalMode.SINGLE_DOC)
-                mode = OperationalMode.SINGLE_DOC
-                logger.info("Auto-switched to SINGLE_DOC mode")
-
-            if mode == OperationalMode.COMPARE:
+            # Do NOT auto-switch mode — the user controls mode explicitly
+            # via /single, /compare, or the ⚙️ Settings panel.
+            current_mode = cl.user_session.get("mode")
+            if current_mode == OperationalMode.COMPARE:
                 loaded_names = ", ".join(doc_filenames.values())
                 status = (
                     f"✅ **{filename}** indexed.\n"
                     f"**{num_docs} document(s) loaded:** {loaded_names}\n\n"
-                    "🔀 **Compare Documents mode** is now active.\n"
+                    "🔀 **Compare Documents mode** is active.\n"
                     "Ask a question to get synthesis, comparison table, and discrepancy analysis."
                 )
             else:
-                status = f"✅ **{filename}** uploaded and indexed. Ask me anything about it!"
+                status = f"✅ **{filename}** uploaded and indexed."
+                if num_docs > 1:
+                    loaded_names = ", ".join(doc_filenames.values())
+                    status += (
+                        f"\n\n**{num_docs} document(s) loaded:** {loaded_names}\n"
+                        "� Type `/compare` to switch to Compare Documents mode, "
+                        "or keep asking questions in Single Document mode."
+                    )
+                else:
+                    status += " Ask me anything about it!"
 
             await cl.Message(
                 content=status,

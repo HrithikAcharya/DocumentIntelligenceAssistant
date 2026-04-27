@@ -154,7 +154,7 @@ class QualityMetricsComputer:
             if kw in best_tf:
                 matched += 1
                 tf_s = math.log(1 + best_tf[kw])
-                idf  = math.log(1 + num_chunks / (1 + chunk_hit.get(kw, 0)))
+                idf = math.log(1 + num_chunks / (1 + chunk_hit.get(kw, 0)))
                 raw_score    += tf_s * idf
                 # max IDF assumes keyword appears in exactly 1 chunk
                 max_possible += tf_s * math.log(1 + num_chunks / 2)
@@ -166,7 +166,22 @@ class QualityMetricsComputer:
             return 0.0
 
         match_rate = matched / len(query_keywords)
-        normalised = (raw_score / max_possible) * match_rate
+
+        if num_chunks == 1:
+            # With a single chunk IDF always cancels to 1.0, making confidence == keyword_match.
+            # Instead, measure topical density: fraction of chunk tokens that are query keywords.
+            # This produces a genuinely different signal — a large chunk with few keyword
+            # occurrences scores lower than a focused chunk where keywords dominate.
+            all_chunk_tokens = _tokenize(chunks[0].page_content)
+            total_tokens = max(len(all_chunk_tokens), 1)
+            keyword_hits = sum(all_chunk_tokens.count(kw) for kw in query_keywords if kw in best_tf)
+            density = min(1.0, keyword_hits / total_tokens)
+            # Scale density to [0, 100] — a chunk that is 10%+ query keywords is very focused
+            # (density of 0.10 → score of 100 after scaling by 10x, capped at 1.0)
+            normalised = min(1.0, density * 10.0) * match_rate
+        else:
+            normalised = (raw_score / max_possible) * match_rate
+
         return round(min(1.0, normalised) * 100.0, 2)
 
     def compute(
