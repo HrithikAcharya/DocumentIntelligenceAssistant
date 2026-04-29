@@ -153,11 +153,8 @@ class RAGEngine:
     def _retrieve_balanced(self, query: str, doc_filenames: dict) -> list[Document]:
         """
         Retrieve chunks ensuring balanced representation across all documents.
-
-        Scans the FAISS docstore directly to get chunks per document,
-        guaranteeing every document is represented in the context.
-        Uses the first N chunks per document (ordered by page number)
-        to avoid re-embedding overhead.
+        Uses similarity search per document source for accurate relevance,
+        capped at chunks_per_doc per document to control prompt size.
         """
         if not doc_filenames:
             return self._retrieve(query)
@@ -166,90 +163,69 @@ class RAGEngine:
         if len(filenames) <= 1:
             return self._retrieve(query)
 
-        chunks_per_doc = max(3, self.top_k // max(len(doc_filenames), 1))
+        # Cap at 2 chunks per doc to keep prompt small and within TPM limits
+        chunks_per_doc = max(2, self.top_k // max(len(doc_filenames), 1))
 
-        # Scan docstore to get ALL chunks grouped by source
-        by_source: dict[str, list[Document]] = {}
+        # Single similarity search across all docs, then cap per source
         try:
             all_docs = list(self.vector_store.docstore._dict.values())
-            for doc in all_docs:
-                src = doc.metadata.get("source", "unknown")
-                by_source.setdefault(src, []).append(doc)
-            logger.info(
-                "Docstore scan: %d total chunks, sources: %s",
-                len(all_docs), list(by_source.keys())
-            )
+            candidate_k = min(chunks_per_doc * len(filenames) * 3, len(all_docs))
+            candidates = self.vector_store.similarity_search(query, k=candidate_k)
         except Exception as e:
-            logger.warning("Docstore scan failed: %s", e)
+            logger.warning("Balanced retrieval failed: %s", e)
             return self._retrieve(query)
 
-        # Also do a global similarity search to get the most relevant chunks
-        try:
-            # Limit candidate search to 20 to keep it fast
-            similar = self.vector_store.similarity_search(query, k=min(20, len(all_docs)))
-            for doc in similar:
-                src = doc.metadata.get("source", "unknown")
-                # Mark similarity-retrieved chunks so we prefer them
-                doc.metadata["_sim_retrieved"] = True
-                if src in by_source:
-                    # Move to front of the list for this source
-                    existing = [d for d in by_source[src] if d.page_content != doc.page_content]
-                    by_source[src] = [doc] + existing
-        except Exception:
-            pass  # Fall back to page-order selection
-
-        # Select top chunks_per_doc from each document
+        from collections import defaultdict
+        seen: dict[str, int] = defaultdict(int)
         selected = []
-        for filename in filenames:
-            doc_chunks = by_source.get(filename, [])
-            if not doc_chunks:
-                logger.warning("No chunks in docstore for: %s", filename)
-                continue
-            # Sort by page number for coherent context
-            doc_chunks_sorted = sorted(
-                doc_chunks[:chunks_per_doc * 3],
-                key=lambda d: (
-                    0 if d.metadata.get("_sim_retrieved") else 1,
-                    d.metadata.get("page", 999)
-                )
-            )
-            top = doc_chunks_sorted[:chunks_per_doc]
-            selected.extend(top)
-            logger.info("Selected %d chunks from %s", len(top), filename)
+        # First pass: fill from similarity-ranked candidates
+        for chunk in candidates:
+            src = chunk.metadata.get("source", "unknown")
+            if src in filenames and seen[src] < chunks_per_doc:
+                selected.append(chunk)
+                seen[src] += 1
+
+        # Second pass: ensure every document has at least 1 chunk
+        missing = [f for f in filenames if seen[f] == 0]
+        if missing:
+            try:
+                all_docs_list = list(self.vector_store.docstore._dict.values())
+                by_source = defaultdict(list)
+                for doc in all_docs_list:
+                    by_source[doc.metadata.get("source", "unknown")].append(doc)
+                for fname in missing:
+                    fallback = by_source.get(fname, [])
+                    if fallback:
+                        selected.append(fallback[0])
+                        logger.info("Fallback chunk added for: %s", fname)
+            except Exception:
+                pass
 
         logger.info(
-            "Balanced retrieval: %d chunks from %d/%d documents",
-            len(selected), len([f for f in filenames if f in by_source]), len(filenames)
+            "Balanced retrieval: %d chunks from %d docs (cap %d/doc)",
+            len(selected), len(filenames), chunks_per_doc
         )
         return selected
 
     def _estimate_prompt_tokens(
-        self, system_prompt: str, chunks: list[Document], query: str
+        self, system_prompt: str, chunks: list[Document], query: str,
+        mode: OperationalMode = None
     ) -> int:
         """
-        Estimate the total token count (input + expected output) for rate limiting.
+        Estimate total token count (input + expected output) for rate limiting.
 
-        Uses a conservative character-to-token ratio (4 chars ≈ 1 token) for
-        input, then adds an estimated output budget. The output estimate is
-        1.5x the input to account for the LLM's response tokens, which the
-        API counts against the TPM limit but which we cannot know in advance.
-
-        Args:
-            system_prompt: The mode-specific system prompt string.
-            chunks: Retrieved document chunks.
-            query: The user's query string.
-
-        Returns:
-            Estimated total token count (input + output buffer).
+        Uses 4 chars ≈ 1 token for input. Output buffer is 2× input for
+        compare mode (longer structured responses) and 1.5× for single doc.
         """
         context_text = "\n\n".join(chunk.page_content for chunk in chunks)
         input_chars = len(system_prompt) + len(context_text) + len(query)
         input_tokens = input_chars // CHARS_PER_TOKEN
-        # Add 50% buffer for expected output tokens (LLM response)
-        total_estimated = int(input_tokens * 1.5)
+        # Compare mode generates longer responses (synthesis + table + analysis)
+        multiplier = 2.0 if mode == OperationalMode.COMPARE else 1.5
+        total_estimated = int(input_tokens * multiplier)
         logger.info(
-            "Estimated tokens — input: %d, total with output buffer: %d",
-            input_tokens, total_estimated
+            "Estimated tokens — input: %d, total (×%.1f): %d",
+            input_tokens, multiplier, total_estimated
         )
         return total_estimated
 
@@ -350,7 +326,7 @@ class RAGEngine:
 
         # Build prompt and estimate tokens
         system_prompt = self.prompt_builder.get_system_prompt(mode)
-        estimated_tokens = self._estimate_prompt_tokens(system_prompt, chunks, query)
+        estimated_tokens = self._estimate_prompt_tokens(system_prompt, chunks, query, mode)
 
         # Enforce rate limits proactively
         await self.rate_limiter.check_and_wait(estimated_tokens)
@@ -387,8 +363,10 @@ class RAGEngine:
             initial_delay=self.initial_retry_delay,
         )
 
-        # Record the completed request
-        self.rate_limiter.record_request(estimated_tokens)
+        # Record actual tokens consumed (input estimate + actual output length)
+        actual_output_tokens = len(answer) // CHARS_PER_TOKEN
+        actual_total = estimated_tokens + actual_output_tokens
+        self.rate_limiter.record_request(actual_total)
 
         # Extract citations
         citations = self._citation_parser.extract_citations(answer)

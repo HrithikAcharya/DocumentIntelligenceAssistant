@@ -44,8 +44,8 @@ class AppConfig:
             model_name=os.environ.get("GEMINI_MODEL", "models/gemini-2.5-flash"),
             embedding_model="local:all-MiniLM-L6-v2",  # local, no API quota
             top_k=int(os.environ.get("TOP_K", "4")),
-            chunk_size=int(os.environ.get("CHUNK_SIZE", "800")),
-            chunk_overlap=int(os.environ.get("CHUNK_OVERLAP", "80")),
+            chunk_size=int(os.environ.get("CHUNK_SIZE", "600")),
+            chunk_overlap=int(os.environ.get("CHUNK_OVERLAP", "60")),
             max_retries=int(os.environ.get("MAX_RETRIES", "5")),
             initial_retry_delay=float(os.environ.get("INITIAL_RETRY_DELAY", "1.0")),
         )

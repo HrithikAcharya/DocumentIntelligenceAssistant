@@ -218,15 +218,12 @@ async def on_message(message: cl.Message):
             cl.user_session.set("active_pdf", filename)
             cl.user_session.set("previous_turn", None)
 
-            # --- Rebuild vector store from ALL documents ---
+            # --- Add to vector store (incremental if one already exists) ---
+            existing_store = cl.user_session.get("vector_store")
             all_files = list(doc_bytes.items())  # [(filename, bytes), ...]
-            logger.info(
-                "Rebuilding vector store from %d document(s): %s",
-                len(all_files), [f for f, _ in all_files]
-            )
 
-            async with cl.Step(name=f"📄 Indexing {len(all_files)} document(s)") as step:
-                step.output = f"Building index from {len(all_files)} document(s)…"
+            async with cl.Step(name=f"📄 Indexing {filename}") as step:
+                step.output = f"Embedding {filename}…"
                 ingestor = DocumentIngestor(
                     embeddings=embeddings,
                     chunk_size=config.chunk_size,
@@ -234,8 +231,19 @@ async def on_message(message: cl.Message):
                 )
                 try:
                     await cl.sleep(0)
-                    vector_store = ingestor.ingest(all_files)
+                    if existing_store is None:
+                        # First document — build fresh
+                        logger.info("Building new vector store for '%s'", filename)
+                        vector_store = ingestor.ingest([(filename, file_bytes)])
+                    else:
+                        # Additional document — merge into existing store
+                        logger.info("Incrementally adding '%s' to existing store", filename)
+                        vector_store = ingestor.ingest_incremental(
+                            filename, file_bytes, existing_store
+                        )
                     cl.user_session.set("vector_store", vector_store)
+                    # Invalidate cached RAGEngine so it picks up the new store
+                    cl.user_session.set("rag_engine", None)
 
                     # Verify — scan ALL docs in the store
                     all_stored_docs = list(vector_store.docstore._dict.values())
@@ -243,10 +251,10 @@ async def on_message(message: cl.Message):
                         d.metadata.get("source", "?") for d in all_stored_docs
                     )
                     logger.info(
-                        "✅ Vector store rebuilt. Sources: %s | Total chunks: %d",
+                        "✅ Vector store updated. Sources: %s | Total chunks: %d",
                         sources_in_store, len(all_stored_docs)
                     )
-                    step.output = f"✅ Indexed {len(all_files)} document(s)"
+                    step.output = f"✅ {filename} indexed"
 
                 except ValueError as e:
                     await cl.Message(content=f"❌ {e}").send()

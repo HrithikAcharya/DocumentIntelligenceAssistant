@@ -197,3 +197,53 @@ class DocumentIngestor:
 
         # Build vector store
         return self.build_vector_store(all_chunks)
+
+    def ingest_incremental(
+        self,
+        filename: str,
+        file_bytes: bytes,
+        existing_store: FAISS,
+    ) -> FAISS:
+        """
+        Incrementally add a single new document to an existing FAISS vector store.
+
+        Only the new document is embedded — the existing store is not rebuilt.
+        Uses FAISS.merge_from() to combine the new index into the existing one
+        in-place, which is significantly faster than rebuilding from scratch.
+
+        Args:
+            filename: Name of the new PDF file.
+            file_bytes: Raw bytes of the new PDF file.
+            existing_store: The current FAISS vector store to merge into.
+
+        Returns:
+            The updated FAISS vector store (same object, mutated in-place).
+
+        Raises:
+            ValueError: If the file is invalid, corrupted, or has no readable text.
+        """
+        logger.info("Incremental ingest of '%s' into existing store...", filename)
+
+        # Validate
+        if not self.validate_pdf(file_bytes):
+            raise ValueError(
+                f"The file '{filename}' is not a valid PDF. "
+                "Only PDF files are accepted."
+            )
+
+        # Extract and chunk only the new document
+        pages = self.extract_pages(file_bytes, filename)
+        chunks = self.chunk_documents(pages)
+
+        # Build a small FAISS index for just the new document
+        logger.info("Embedding %d chunks for '%s'...", len(chunks), filename)
+        new_store = FAISS.from_documents(chunks, self.embeddings)
+
+        # Merge new index into existing store (no re-embedding of existing docs)
+        existing_store.merge_from(new_store)
+        logger.info(
+            "Merged '%s' into existing store. Total chunks: %d",
+            filename,
+            len(existing_store.docstore._dict),
+        )
+        return existing_store
