@@ -47,6 +47,9 @@ coverage.xml
 *.faiss
 *.pkl
 
+# Rate limiter state (persisted quota tracking)
+src/.rate_limiter_state.json
+
 # Jupyter
 .ipynb_checkpoints/
 
