@@ -109,12 +109,11 @@ class RAGEngine:
 
             if num_sources <= 1:
                 # Single document — use MMR for intra-document diversity
-                # (avoids returning near-duplicate overlapping chunks)
                 results = self.vector_store.max_marginal_relevance_search(
                     query,
                     k=self.top_k,
-                    fetch_k=min(self.top_k * 4, len(all_docs) if all_docs else self.top_k * 4),
-                    lambda_mult=0.7,  # 0=max diversity, 1=max relevance; 0.7 balances both
+                    fetch_k=min(self.top_k * 5, len(all_docs) if all_docs else self.top_k * 5),
+                    lambda_mult=0.6,  # 0=max diversity, 1=max relevance; 0.6 favours relevance
                 )
                 logger.info(
                     "MMR retrieval (single doc): %d chunks from %d candidates",
@@ -163,8 +162,8 @@ class RAGEngine:
         if len(filenames) <= 1:
             return self._retrieve(query)
 
-        # Cap at 2 chunks per doc to keep prompt small and within TPM limits
-        chunks_per_doc = max(2, self.top_k // max(len(doc_filenames), 1))
+        # 3 chunks per doc minimum for accuracy, capped to stay within TPM
+        chunks_per_doc = max(3, self.top_k // max(len(doc_filenames), 1))
 
         # Single similarity search across all docs, then cap per source
         try:
@@ -212,21 +211,17 @@ class RAGEngine:
         mode: OperationalMode = None
     ) -> int:
         """
-        Estimate total token count (input + expected output) for rate limiting.
-
-        Uses 4 chars ≈ 1 token for input. Output buffer is 2× input for
-        compare mode (longer structured responses) and 1.5× for single doc.
+        Estimate input token count for the proactive rate limit check.
+        Uses 4 chars ≈ 1 token. Adds a modest 30% output buffer — just
+        enough to avoid the edge, without over-blocking subsequent queries.
+        Actual tokens are recorded separately after the response is received.
         """
         context_text = "\n\n".join(chunk.page_content for chunk in chunks)
         input_chars = len(system_prompt) + len(context_text) + len(query)
         input_tokens = input_chars // CHARS_PER_TOKEN
-        # Compare mode generates longer responses (synthesis + table + analysis)
-        multiplier = 2.0 if mode == OperationalMode.COMPARE else 1.5
-        total_estimated = int(input_tokens * multiplier)
-        logger.info(
-            "Estimated tokens — input: %d, total (×%.1f): %d",
-            input_tokens, multiplier, total_estimated
-        )
+        # 30% buffer — conservative enough to avoid 429s without over-blocking
+        total_estimated = int(input_tokens * 1.3)
+        logger.info("Estimated tokens for rate check: %d", total_estimated)
         return total_estimated
 
     def _build_context(self, chunks: list[Document], doc_filenames: dict = None) -> str:
@@ -293,8 +288,8 @@ class RAGEngine:
         Raises:
             QuotaExhaustedError: If the daily API quota is exhausted.
         """
-        # Check cache first
-        cache_key = self.cache.make_key(query, doc_ids)
+        # Check cache first — key includes mode to avoid single/compare collisions
+        cache_key = self.cache.make_key(query + f"|{mode.value}", doc_ids)
         cached = self.cache.get(cache_key)
         if cached is not None:
             logger.info("Cache hit for query.")
@@ -363,10 +358,15 @@ class RAGEngine:
             initial_delay=self.initial_retry_delay,
         )
 
-        # Record actual tokens consumed (input estimate + actual output length)
+        # Record actual tokens consumed: input tokens + actual output tokens
+        # (do NOT add to estimated_tokens which already has an output buffer baked in)
+        input_chars = len(system_prompt) + len(context) + len(query)
+        input_tokens = input_chars // CHARS_PER_TOKEN
         actual_output_tokens = len(answer) // CHARS_PER_TOKEN
-        actual_total = estimated_tokens + actual_output_tokens
+        actual_total = input_tokens + actual_output_tokens
         self.rate_limiter.record_request(actual_total)
+        logger.info("Actual tokens recorded: input=%d, output=%d, total=%d",
+                    input_tokens, actual_output_tokens, actual_total)
 
         # Extract citations
         citations = self._citation_parser.extract_citations(answer)
