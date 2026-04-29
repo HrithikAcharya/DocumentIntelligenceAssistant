@@ -143,15 +143,6 @@ class RAGEngine:
                     dict(seen),
                 )
 
-            # Log relevance scores for the top chunks (for debugging)
-            try:
-                scored = self.vector_store.similarity_search_with_relevance_scores(query, k=3)
-                top_scores = [(round(score, 3), doc.metadata.get("source","?"), doc.metadata.get("page","?"))
-                              for doc, score in scored]
-                logger.info("Top-3 relevance scores: %s", top_scores)
-            except Exception:
-                pass  # Scoring is diagnostic only; don't break retrieval
-
             logger.debug("Retrieved %d chunks for query.", len(results))
             return results
 
@@ -194,7 +185,8 @@ class RAGEngine:
 
         # Also do a global similarity search to get the most relevant chunks
         try:
-            similar = self.vector_store.similarity_search(query, k=min(50, len(all_docs)))
+            # Limit candidate search to 20 to keep it fast
+            similar = self.vector_store.similarity_search(query, k=min(20, len(all_docs)))
             for doc in similar:
                 src = doc.metadata.get("source", "unknown")
                 # Mark similarity-retrieved chunks so we prefer them

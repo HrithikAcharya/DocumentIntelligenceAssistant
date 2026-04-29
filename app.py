@@ -67,6 +67,9 @@ citation_parser = CitationParser()
 # Shared rate limiter — module-level singleton so quota is tracked across
 # all user sessions and survives session reconnects
 rate_limiter = RateLimiter()
+# Shared RAG engine components — instantiated once at module level
+_quality_computer = QualityMetricsComputer(embeddings)
+_citation_parser_instance = CitationParser()
 
 MODE_LABELS = {
     "Single Document": OperationalMode.SINGLE_DOC,
@@ -390,17 +393,22 @@ async def on_message(message: cl.Message):
     cache: ResponseCache = cl.user_session.get("cache")
     pdf_paths: dict = cl.user_session.get("pdf_paths", {})
 
-    rag_engine = RAGEngine(
-        vector_store=vector_store,
-        llm=llm,
-        embeddings=embeddings,
-        prompt_builder=prompt_builder,
-        cache=cache,
-        rate_limiter=rate_limiter,
-        top_k=config.top_k,
-        max_retries=config.max_retries,
-        initial_retry_delay=config.initial_retry_delay,
-    )
+    # Reuse the RAGEngine from session if vector_store hasn't changed,
+    # otherwise create a new one. This avoids recreating it on every query.
+    rag_engine: RAGEngine = cl.user_session.get("rag_engine")
+    if rag_engine is None or rag_engine.vector_store is not vector_store:
+        rag_engine = RAGEngine(
+            vector_store=vector_store,
+            llm=llm,
+            embeddings=embeddings,
+            prompt_builder=prompt_builder,
+            cache=cache,
+            rate_limiter=rate_limiter,
+            top_k=config.top_k,
+            max_retries=config.max_retries,
+            initial_retry_delay=config.initial_retry_delay,
+        )
+        cl.user_session.set("rag_engine", rag_engine)
 
     # Show what we're doing
     if mode == OperationalMode.COMPARE:
