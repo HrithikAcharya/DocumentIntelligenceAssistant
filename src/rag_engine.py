@@ -3,6 +3,7 @@ RAG Engine for the Document Intelligence Assistant.
 Orchestrates retrieval, prompt construction, LLM generation, and quality metrics.
 """
 import logging
+import re
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -23,6 +24,52 @@ logger = logging.getLogger(__name__)
 CHARS_PER_TOKEN = 4
 # Gemini 1.5 Flash context window limit
 MAX_CONTEXT_TOKENS = 1_048_576
+
+# ---------------------------------------------------------------------------
+# Query intent classification
+# ---------------------------------------------------------------------------
+_COMPARISON_TRIGGERS = frozenset([
+    "compare", "contrast", "differ", "difference", "differences",
+    "similarities", "similarity", "similar", "versus", " vs ", "vs.",
+    "which is better", "how do they compare", "what are the differences",
+    "what are the similarities", "side by side",
+])
+
+_SYNTHESIS_TRIGGERS = frozenset([
+    "summarise", "summarize", "summary", "overview", "main topic",
+    "main topics", "what do these", "what do both", "what do all",
+    "cover", "about", "key points", "key themes", "main points",
+    "what is discussed", "what are these documents",
+])
+
+_LIST_TRIGGERS = frozenset([
+    "list", "enumerate", "what are all", "give me all", "all the",
+    "steps", "recommendations", "findings",
+])
+
+_ANALYTICAL_TRIGGERS = frozenset([
+    "implications", "impact", "significance", "why", "how does",
+    "analyse", "analyze", "analysis", "evaluate", "assess",
+    "relationship", "relate", "explain",
+])
+
+
+def _classify_query(query: str) -> str:
+    """
+    Classify a query into one of four intent categories.
+
+    Returns one of: "comparison", "synthesis", "list", "analytical", "factual"
+    """
+    q = query.lower()
+    if any(t in q for t in _COMPARISON_TRIGGERS):
+        return "comparison"
+    if any(t in q for t in _SYNTHESIS_TRIGGERS):
+        return "synthesis"
+    if any(t in q for t in _LIST_TRIGGERS):
+        return "list"
+    if any(t in q for t in _ANALYTICAL_TRIGGERS):
+        return "analytical"
+    return "factual"
 
 
 @dataclass
@@ -153,6 +200,8 @@ class RAGEngine:
         """
         Retrieve chunks ensuring balanced representation across all documents.
         Guarantees every document contributes at least min_per_doc chunks.
+        Scales chunk count per document based on query intent — synthesis and
+        analytical queries need more context than factual lookups.
         """
         if not doc_filenames:
             return self._retrieve(query)
@@ -161,8 +210,15 @@ class RAGEngine:
         if len(filenames) <= 1:
             return self._retrieve(query)
 
-        # 3 chunks per doc for accuracy, capped to stay within TPM
-        chunks_per_doc = max(3, self.top_k // max(len(doc_filenames), 1))
+        # Scale chunks per doc by query intent:
+        # comparison/synthesis/analytical need more context than factual/list
+        query_intent = _classify_query(query)
+        if query_intent in ("comparison", "synthesis", "analytical"):
+            chunks_per_doc = max(4, self.top_k // max(len(doc_filenames), 1))
+        else:
+            chunks_per_doc = max(3, self.top_k // max(len(doc_filenames), 1))
+
+        logger.info("Balanced retrieval: intent=%s, chunks_per_doc=%d", query_intent, chunks_per_doc)
 
         # Build source→chunks map from docstore for fallback
         try:
@@ -239,25 +295,20 @@ class RAGEngine:
         logger.info("Estimated tokens for rate check: %d", total_estimated)
         return total_estimated
 
-    def _build_context(self, chunks: list[Document], doc_filenames: dict = None) -> str:
+    def _build_context(self, chunks: list[Document], doc_filenames: dict = None, query_intent: str = "factual") -> str:
         """
         Format retrieved chunks into a context string for the prompt.
-        In Compare mode, prepends a clear document inventory and groups
-        chunks by source so the LLM sees each document's content separately.
+        In Compare mode, prepends a neutral document list so the LLM knows
+        what sources are available without being pushed toward any format.
         """
         parts = []
 
-        # In Compare mode, add a prominent document inventory header
+        # In Compare mode, list the available documents neutrally
         if doc_filenames and len(doc_filenames) > 1:
             filenames = list(doc_filenames.values())
-            inventory = "=== DOCUMENTS AVAILABLE FOR COMPARISON ===\n"
+            inventory = "Documents loaded:\n"
             for i, fname in enumerate(filenames, 1):
-                inventory += f"  Document {i}: {fname}\n"
-            inventory += (
-                "\nIMPORTANT: Your response MUST reference ALL of the above documents.\n"
-                "For each document, either cite relevant content or explicitly state "
-                "that no relevant content was found.\n"
-            )
+                inventory += f"  {i}. {fname}\n"
             parts.append(inventory)
 
         # Group chunks by source for cleaner context
@@ -266,7 +317,6 @@ class RAGEngine:
             src = chunk.metadata.get("source", "unknown")
             by_source.setdefault(src, []).append(chunk)
 
-        # Log what's actually being sent to the LLM
         logger.info("Building context with sources: %s", list(by_source.keys()))
 
         for source, source_chunks in by_source.items():
@@ -314,6 +364,10 @@ class RAGEngine:
             logger.info("Cache hit for query.")
             return cached
 
+        # Classify query intent — used to tune retrieval depth and context framing
+        query_intent = _classify_query(query)
+        logger.info("Query intent: %s", query_intent)
+
         # Retrieve relevant chunks — balanced across docs in Compare mode
         logger.info(
             "Query mode: %s | doc_filenames: %s | len: %d",
@@ -345,16 +399,20 @@ class RAGEngine:
         # Enforce rate limits proactively
         await self.rate_limiter.check_and_wait(estimated_tokens)
 
-        # Build context string — include document inventory for Compare mode
-        context = self._build_context(chunks, doc_filenames if mode == OperationalMode.COMPARE else None)
+        # Build context string — pass query intent so inventory note is appropriate
+        context = self._build_context(
+            chunks,
+            doc_filenames if mode == OperationalMode.COMPARE else None,
+            query_intent=query_intent,
+        )
 
         # Log context sources for debugging
         context_sources = set(c.metadata.get("source", "?") for c in chunks)
         logger.info("Context sources being sent to LLM: %s", context_sources)
         logger.info("Total chunks in context: %d", len(chunks))
 
-        # Build prompt template
-        prompt_template = self.prompt_builder.build_prompt(mode, previous_turn)
+        # Build prompt template — pass query intent for explicit format hint
+        prompt_template = self.prompt_builder.build_prompt(mode, previous_turn, query_intent=query_intent)
 
         # Build LCEL chain
         chain = prompt_template | self.llm | StrOutputParser()
