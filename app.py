@@ -64,6 +64,9 @@ embeddings = HuggingFaceEmbeddings(
 
 prompt_builder = PromptBuilder()
 citation_parser = CitationParser()
+# Shared rate limiter — module-level singleton so quota is tracked across
+# all user sessions and survives session reconnects
+rate_limiter = RateLimiter()
 
 MODE_LABELS = {
     "Single Document": OperationalMode.SINGLE_DOC,
@@ -89,7 +92,6 @@ async def on_chat_start():
     cl.user_session.set("pdf_paths", {})            # filename → file_path
     cl.user_session.set("active_pdf", None)
     cl.user_session.set("cache", ResponseCache())
-    cl.user_session.set("rate_limiter", RateLimiter())
     cl.user_session.set("previous_turn", None)
 
     await cl.ChatSettings([
@@ -386,7 +388,6 @@ async def on_message(message: cl.Message):
         return
 
     cache: ResponseCache = cl.user_session.get("cache")
-    rate_limiter: RateLimiter = cl.user_session.get("rate_limiter")
     pdf_paths: dict = cl.user_session.get("pdf_paths", {})
 
     rag_engine = RAGEngine(
