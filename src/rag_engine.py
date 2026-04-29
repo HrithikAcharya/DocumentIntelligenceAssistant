@@ -175,7 +175,7 @@ class RAGEngine:
         if len(filenames) <= 1:
             return self._retrieve(query)
 
-        chunks_per_doc = max(5, self.top_k)
+        chunks_per_doc = max(3, self.top_k // max(len(doc_filenames), 1))
 
         # Scan docstore to get ALL chunks grouped by source
         by_source: dict[str, list[Document]] = {}
@@ -235,9 +235,12 @@ class RAGEngine:
         self, system_prompt: str, chunks: list[Document], query: str
     ) -> int:
         """
-        Estimate the token count of the constructed prompt.
+        Estimate the total token count (input + expected output) for rate limiting.
 
-        Uses a conservative character-to-token ratio (4 chars ≈ 1 token).
+        Uses a conservative character-to-token ratio (4 chars ≈ 1 token) for
+        input, then adds an estimated output budget. The output estimate is
+        1.5x the input to account for the LLM's response tokens, which the
+        API counts against the TPM limit but which we cannot know in advance.
 
         Args:
             system_prompt: The mode-specific system prompt string.
@@ -245,13 +248,18 @@ class RAGEngine:
             query: The user's query string.
 
         Returns:
-            Estimated token count.
+            Estimated total token count (input + output buffer).
         """
         context_text = "\n\n".join(chunk.page_content for chunk in chunks)
-        total_chars = len(system_prompt) + len(context_text) + len(query)
-        estimated_tokens = total_chars // CHARS_PER_TOKEN
-        logger.info("Estimated prompt token count: %d", estimated_tokens)
-        return estimated_tokens
+        input_chars = len(system_prompt) + len(context_text) + len(query)
+        input_tokens = input_chars // CHARS_PER_TOKEN
+        # Add 50% buffer for expected output tokens (LLM response)
+        total_estimated = int(input_tokens * 1.5)
+        logger.info(
+            "Estimated tokens — input: %d, total with output buffer: %d",
+            input_tokens, total_estimated
+        )
+        return total_estimated
 
     def _build_context(self, chunks: list[Document], doc_filenames: dict = None) -> str:
         """
