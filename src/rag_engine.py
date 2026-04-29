@@ -152,8 +152,7 @@ class RAGEngine:
     def _retrieve_balanced(self, query: str, doc_filenames: dict) -> list[Document]:
         """
         Retrieve chunks ensuring balanced representation across all documents.
-        Uses similarity search per document source for accurate relevance,
-        capped at chunks_per_doc per document to control prompt size.
+        Guarantees every document contributes at least min_per_doc chunks.
         """
         if not doc_filenames:
             return self._retrieve(query)
@@ -162,21 +161,37 @@ class RAGEngine:
         if len(filenames) <= 1:
             return self._retrieve(query)
 
-        # 3 chunks per doc minimum for accuracy, capped to stay within TPM
+        # 3 chunks per doc for accuracy, capped to stay within TPM
         chunks_per_doc = max(3, self.top_k // max(len(doc_filenames), 1))
 
-        # Single similarity search across all docs, then cap per source
+        # Build source→chunks map from docstore for fallback
         try:
             all_docs = list(self.vector_store.docstore._dict.values())
-            candidate_k = min(chunks_per_doc * len(filenames) * 3, len(all_docs))
+        except Exception as e:
+            logger.warning("Docstore access failed: %s", e)
+            return self._retrieve(query)
+
+        by_source: dict[str, list[Document]] = {}
+        for doc in all_docs:
+            src = doc.metadata.get("source", "unknown")
+            by_source.setdefault(src, []).append(doc)
+
+        # Log what sources are actually in the store
+        logger.info("Sources in vector store: %s", list(by_source.keys()))
+        logger.info("Expected filenames: %s", filenames)
+
+        # Similarity search — get ranked candidates
+        try:
+            candidate_k = min(chunks_per_doc * len(filenames) * 4, len(all_docs))
             candidates = self.vector_store.similarity_search(query, k=candidate_k)
         except Exception as e:
-            logger.warning("Balanced retrieval failed: %s", e)
-            return self._retrieve(query)
+            logger.warning("Similarity search failed: %s", e)
+            candidates = []
 
         from collections import defaultdict
         seen: dict[str, int] = defaultdict(int)
         selected = []
+
         # First pass: fill from similarity-ranked candidates
         for chunk in candidates:
             src = chunk.metadata.get("source", "unknown")
@@ -184,25 +199,25 @@ class RAGEngine:
                 selected.append(chunk)
                 seen[src] += 1
 
-        # Second pass: ensure every document has at least 1 chunk
-        missing = [f for f in filenames if seen[f] == 0]
-        if missing:
-            try:
-                all_docs_list = list(self.vector_store.docstore._dict.values())
-                by_source = defaultdict(list)
-                for doc in all_docs_list:
-                    by_source[doc.metadata.get("source", "unknown")].append(doc)
-                for fname in missing:
-                    fallback = by_source.get(fname, [])
-                    if fallback:
-                        selected.append(fallback[0])
-                        logger.info("Fallback chunk added for: %s", fname)
-            except Exception:
-                pass
+        # Second pass: ensure every expected document has at least min_per_doc chunks
+        # Use docstore fallback for any missing document
+        for fname in filenames:
+            if seen[fname] < 1:
+                logger.warning("No chunks retrieved for '%s' via similarity — using docstore fallback", fname)
+                fallback_chunks = by_source.get(fname, [])
+                if fallback_chunks:
+                    # Take the first chunks_per_doc chunks as fallback
+                    for chunk in fallback_chunks[:chunks_per_doc]:
+                        selected.append(chunk)
+                        seen[fname] += 1
+                    logger.info("Added %d fallback chunks for '%s'", seen[fname], fname)
+                else:
+                    logger.error("No chunks found in docstore for '%s' — document may not be indexed", fname)
 
         logger.info(
-            "Balanced retrieval: %d chunks from %d docs (cap %d/doc)",
-            len(selected), len(filenames), chunks_per_doc
+            "Balanced retrieval result: %d total chunks | per-doc: %s",
+            len(selected),
+            {fname: seen[fname] for fname in filenames}
         )
         return selected
 
@@ -227,21 +242,22 @@ class RAGEngine:
     def _build_context(self, chunks: list[Document], doc_filenames: dict = None) -> str:
         """
         Format retrieved chunks into a context string for the prompt.
-
-        In Compare mode, prepends a document inventory so the LLM knows
-        exactly which documents are available, preventing it from ignoring
-        documents that happen to have fewer retrieved chunks.
+        In Compare mode, prepends a clear document inventory and groups
+        chunks by source so the LLM sees each document's content separately.
         """
         parts = []
 
-        # In Compare mode, add a document inventory header
+        # In Compare mode, add a prominent document inventory header
         if doc_filenames and len(doc_filenames) > 1:
             filenames = list(doc_filenames.values())
-            inventory = "DOCUMENTS AVAILABLE FOR COMPARISON:\n"
+            inventory = "=== DOCUMENTS AVAILABLE FOR COMPARISON ===\n"
             for i, fname in enumerate(filenames, 1):
-                inventory += f"  {i}. {fname}\n"
-            inventory += "\nYou MUST reference ALL of the above documents in your response.\n"
-            inventory += "If a document has no relevant content for this query, explicitly state that.\n"
+                inventory += f"  Document {i}: {fname}\n"
+            inventory += (
+                "\nIMPORTANT: Your response MUST reference ALL of the above documents.\n"
+                "For each document, either cite relevant content or explicitly state "
+                "that no relevant content was found.\n"
+            )
             parts.append(inventory)
 
         # Group chunks by source for cleaner context
@@ -250,8 +266,11 @@ class RAGEngine:
             src = chunk.metadata.get("source", "unknown")
             by_source.setdefault(src, []).append(chunk)
 
+        # Log what's actually being sent to the LLM
+        logger.info("Building context with sources: %s", list(by_source.keys()))
+
         for source, source_chunks in by_source.items():
-            parts.append(f"=== FROM: {source} ===")
+            parts.append(f"=== CONTENT FROM: {source} ===")
             for chunk in source_chunks:
                 page = chunk.metadata.get("page", "?")
                 parts.append(f"[Source: {source}, Page {page}]\n{chunk.page_content}")
