@@ -478,6 +478,14 @@ async def on_message(message: cl.Message):
         flags=re.DOTALL,
     ).strip()
 
+    # Fix markdown hyperlink citations the LLM sometimes emits:
+    # [filename.pdf](filename.pdf) → **[filename.pdf]**
+    clean_answer = re.sub(
+        r'\[([^\]]+\.pdf[^\]]*)\]\([^\)]+\)',
+        r'**[\1]**',
+        clean_answer,
+    )
+
     quality_footer = (
         f"\n\n---\n"
         f"📊 **Confidence:** `{quality_report.confidence_score:.0f}/100` | "
@@ -489,10 +497,11 @@ async def on_message(message: cl.Message):
 
     final_content = clean_answer + quality_footer
 
-    active_pdf = cl.user_session.get("active_pdf")
+    # Attach all loaded PDFs as side-panel elements so the user can view any of them.
+    # In compare mode this shows all documents; in single mode it shows the active one.
     elements = []
-    if active_pdf and active_pdf in pdf_paths:
-        elements = [cl.Pdf(name=active_pdf, display="side", path=pdf_paths[active_pdf])]
+    for fname, fpath in pdf_paths.items():
+        elements.append(cl.Pdf(name=fname, display="side", path=fpath))
 
     await cl.Message(content=final_content, elements=elements).send()
 

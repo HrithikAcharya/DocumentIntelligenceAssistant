@@ -26,6 +26,7 @@ CORE RULES:
 - Use ALL the context provided — do not ignore any section.
 - If the context does not contain the answer, say: "The answer to this question is not found in the provided document."
 - Cite every factual claim with [Source: <filename.pdf>, Page <N>] using the exact filename and page number from the context headers.
+- CITATION FORMAT: Always use [Source: filename.pdf, Page N] — never use markdown hyperlinks like [text](url).
 - Do NOT hallucinate or infer facts not explicitly stated in the context.
 
 RESPONSE STYLE — match your response to the question type:
@@ -42,6 +43,7 @@ CORE RULES:
 - Answer ONLY from the provided document context. Never use outside knowledge.
 - You MUST address every document listed under "DOCUMENTS AVAILABLE FOR COMPARISON". If a document has no relevant content for the query, explicitly state that.
 - Cite every factual claim with [Source: <filename.pdf>, Page <N>] using the exact filename and page number from the context headers.
+- CITATION FORMAT: Always use [Source: filename.pdf, Page N] — never use markdown hyperlinks like [text](url).
 - Do NOT hallucinate or infer facts not explicitly stated in the context.
 
 RESPONSE FORMAT — always produce all three sections below:
