@@ -67,9 +67,6 @@ citation_parser = CitationParser()
 # Shared rate limiter — module-level singleton so quota is tracked across
 # all user sessions and survives session reconnects
 rate_limiter = RateLimiter()
-# Shared RAG engine components — instantiated once at module level
-_quality_computer = QualityMetricsComputer(embeddings)
-_citation_parser_instance = CitationParser()
 
 MODE_LABELS = {
     "Single Document": OperationalMode.SINGLE_DOC,
